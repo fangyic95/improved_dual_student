@@ -36,29 +36,17 @@ def parameters():
 
         'checkpoint_epochs': 20,
 
-        ################## start improvement list #################
-        'arch': 'cifar_shakeshake26',
-        'arch_r': 'cifar_shakeshake26',
-        'arch_c': 'cnn13',
+        # architecture
+        'arch': 'cnn13',
 
-        ##### cutout #####
-        # 'arch': 'cnn13',
-        # 'dataset': 'cifar10_cutout',
-
-        ##### three students step 1 #####
-        # 'arch': 'cifar_shakeshake26',
-
-        ##### three students step 2 #####
-        # 'arch': 'cnn13',
+        # our implementation
         # 'arch_r': 'cifar_shakeshake26',
-        # 'res_loss_switch': True,
-        # 'consistency_loss_switch': True,
-        # 'stabilization_loss_switch': True,
-        # 'resume_r': './results/ds_cifar10_1000l_shakeshake26_train/2020-03-28_23:56:11/1000_10/transient/checkpoint._best_r.ckpt',
+        'res_loss_switch': True,
+        'consistency_loss_switch': True,
+        'stabilization_loss_switch': True,
 
-        ################# end improvement list ###############
 
-        ##### abandon #####
+        # abandon
         # 'cnnfeature2consis': False,
         # 'cnnfeature2stable': False,
 

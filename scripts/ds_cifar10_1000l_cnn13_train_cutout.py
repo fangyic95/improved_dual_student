@@ -7,7 +7,7 @@ from src.cli import parse_dict_args
 from src.run_context import RunContext
 import dual_student
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import torchvision.models as models
 LOG = logging.getLogger('main')
@@ -37,16 +37,9 @@ def parameters():
         'checkpoint_epochs': 20,
 
         ################## start improvement list #################
-        'arch': 'cifar_shakeshake26',
-        'arch_r': 'cifar_shakeshake26',
-        'arch_c': 'cnn13',
-
-        ##### cutout #####
-        # 'arch': 'cnn13',
-        # 'dataset': 'cifar10_cutout',
-
-        ##### three students step 1 #####
-        # 'arch': 'cifar_shakeshake26',
+        # architecture
+        'arch': 'cnn13',
+        'dataset': 'cifar10_cutout',
 
         ##### three students step 2 #####
         # 'arch': 'cnn13',
