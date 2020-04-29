@@ -25,6 +25,7 @@ LOG = logging.getLogger('main')
 args = None
 best_prec1_l = 0
 best_prec1_r = 0
+best_prec1_c = 0
 best_prec1 = 0
 global_step = 0
 
@@ -118,6 +119,22 @@ def create_model_r(name, num_classes, ema=False):
         arch=args.arch_r))
 
     model_factory = architectures.__dict__[args.arch_r]
+    model_params = dict(pretrained=args.pretrained, num_classes=num_classes)
+    model = model_factory(**model_params)
+    model = nn.DataParallel(model).cuda()
+
+    if ema:
+        for param in model.parameters():
+            param.detach_()
+    return model
+
+def create_model_c(name, num_classes, ema=False):
+    LOG.info('=> creating {pretrained} {name} model: {arch}'.format(
+        pretrained='pre-trained' if args.pretrained else 'non-pre-trained',
+        name=name,
+        arch=args.arch_c))
+
+    model_factory = architectures.__dict__[args.arch_c]
     model_params = dict(pretrained=args.pretrained, num_classes=num_classes)
     model = model_factory(**model_params)
     model = nn.DataParallel(model).cuda()
@@ -483,9 +500,342 @@ def train_epoch(train_loader, l_model, r_model, l_optimizer, r_optimizer, epoch,
                 **meters.averages(),
                 **meters.sums()})
 
+
+def train_epoch_three(train_loader, l_model, r_model, c_model, l_optimizer, r_optimizer, c_optimizer, epoch, log):
+    global global_step
+    a = args
+    meters = AverageMeterSet()
+
+    # define criterions
+    class_criterion = nn.CrossEntropyLoss(size_average=False, ignore_index=NO_LABEL).cuda()
+    residual_logit_criterion = losses.symmetric_mse_loss
+    consistency_criterion = losses.softmax_mse_loss
+    stabilization_criterion = losses.softmax_mse_loss
+
+    l_model.train()
+    r_model.train()
+    c_model.train()
+
+    if args.resume_r:
+        r_model.eval()
+
+    end = time.time()
+    for i, ((l_input, r_input), target) in enumerate(train_loader):
+        meters.update('data_time', time.time() - end)
+        # adjust learning rate
+        adjust_learning_rate(l_optimizer, epoch, i, len(train_loader))
+        adjust_learning_rate(r_optimizer, epoch, i, len(train_loader))
+        adjust_learning_rate(c_optimizer, epoch, i, len(train_loader))
+
+        meters.update('l_lr', l_optimizer.param_groups[0]['lr'])
+        meters.update('r_lr', r_optimizer.param_groups[0]['lr'])
+        meters.update('c_lr', c_optimizer.param_groups[0]['lr'])
+
+        # prepare data
+        l_input_var = Variable(l_input)
+        r_input_var = Variable(r_input)
+        c_input_var = r_input_var.clone()
+        le_input_var = Variable(r_input, requires_grad=False, volatile=True)
+        re_input_var = Variable(l_input, requires_grad=False, volatile=True)
+        ce_input_var = re_input_var.clone()
+        target_var = Variable(target.cuda(async=True))
+
+        minibatch_size = len(target_var)
+        labeled_minibatch_size = target_var.data.ne(NO_LABEL).sum()
+        unlabeled_minibatch_size = minibatch_size - labeled_minibatch_size
+        assert labeled_minibatch_size >= 0 and unlabeled_minibatch_size >= 0
+        meters.update('labeled_minibatch_size', labeled_minibatch_size)
+        meters.update('unlabeled_minibatch_size', unlabeled_minibatch_size)
+
+        # forward
+        l_model_out, l_cnnfeature = l_model(l_input_var, debug=True)
+        r_model_out, r_cnnfeature = r_model(r_input_var, debug=True)
+        c_model_out, c_cnnfeature = c_model(c_input_var, debug=True)
+        le_model_out, le_cnnfeature = l_model(le_input_var, debug=True)
+        re_model_out, re_cnnfeature = r_model(re_input_var, debug=True)
+        ce_model_out, ce_cnnfeature = c_model(ce_input_var, debug=True)
+
+        if isinstance(l_model_out, Variable):
+            assert args.logit_distance_cost < 0
+            l_logit1 = l_model_out
+            r_logit1 = r_model_out
+            c_logit1 = c_model_out
+            le_logit1 = le_model_out
+            re_logit1 = re_model_out
+            ce_logit1 = ce_model_out
+
+        elif len(l_model_out) == 2:
+            assert len(r_model_out) == 2
+            l_logit1, l_logit2 = l_model_out
+            r_logit1, r_logit2 = r_model_out
+            c_logit1, c_logit2 = c_model_out
+            le_logit1, le_logit2 = le_model_out
+            re_logit1, re_logit2 = re_model_out
+            ce_logit1, ce_logit2 = ce_model_out
+
+        # logit distance loss from mean teacher
+        if args.logit_distance_cost >= 0:
+            l_class_logit, l_cons_logit = l_logit1, l_logit2
+            r_class_logit, r_cons_logit = r_logit1, r_logit2
+            c_class_logit, c_cons_logit = c_logit1, c_logit2
+            le_class_logit, le_cons_logit = le_logit1, le_logit2
+            re_class_logit, re_cons_logit = re_logit1, re_logit2
+            ce_class_logit, ce_cons_logit = ce_logit1, ce_logit2
+
+            l_res_loss = args.logit_distance_cost * residual_logit_criterion(l_class_logit, l_cons_logit) / minibatch_size
+            r_res_loss = args.logit_distance_cost * residual_logit_criterion(r_class_logit, r_cons_logit) / minibatch_size
+            c_res_loss = args.logit_distance_cost * residual_logit_criterion(c_class_logit, c_cons_logit) / minibatch_size
+
+            meters.update('l_res_loss', l_res_loss.data[0])
+            meters.update('r_res_loss', r_res_loss.data[0])
+            meters.update('c_res_loss', c_res_loss.data[0])
+
+        else:
+            l_class_logit, l_cons_logit = l_logit1, l_logit1
+            r_class_logit, r_cons_logit = r_logit1, r_logit1
+            c_class_logit, c_cons_logit = c_logit1, c_logit1
+
+            le_class_logit, le_cons_logit = le_logit1, le_logit1
+            re_class_logit, re_cons_logit = re_logit1, re_logit1
+            ce_class_logit, ce_cons_logit = ce_logit1, ce_logit1
+
+            l_res_loss = 0.0
+            r_res_loss = 0.0
+            c_res_loss = 0.0
+            meters.update('l_res_loss', 0.0)
+            meters.update('r_res_loss', 0.0)
+            meters.update('c_res_loss', 0.0)
+
+        # classification loss
+        l_class_loss = class_criterion(l_class_logit, target_var) / minibatch_size
+        r_class_loss = class_criterion(r_class_logit, target_var) / minibatch_size
+        c_class_loss = class_criterion(c_class_logit, target_var) / minibatch_size
+        meters.update('l_class_loss', l_class_loss.data[0])
+        meters.update('r_class_loss', r_class_loss.data[0])
+        meters.update('c_class_loss', c_class_loss.data[0])
+
+        l_loss, r_loss, c_loss = l_class_loss, r_class_loss, c_class_loss
+        if args.res_loss_switch:
+            l_loss += l_res_loss
+            r_loss += r_res_loss
+            c_loss += c_res_loss
+
+        if args.consistency_loss_switch:
+            # consistency loss
+            consistency_weight = args.consistency_scale * ramps.sigmoid_rampup(epoch, args.consistency_rampup)
+            le_class_logit = Variable(le_class_logit.detach().data, requires_grad=False)
+            if args.cnnfeature2consis:
+                le_cnnfeature_ = Variable(le_cnnfeature.detach().data, requires_grad=False)
+                l_consistency_loss = consistency_weight * consistency_criterion(l_cnnfeature, le_cnnfeature_) / minibatch_size
+            else:
+                l_consistency_loss = consistency_weight * consistency_criterion(l_cons_logit, le_class_logit) / minibatch_size
+            meters.update('l_cons_loss', l_consistency_loss.data[0])
+            l_loss += l_consistency_loss
+
+            re_class_logit = Variable(re_class_logit.detach().data, requires_grad=False)
+            if args.cnnfeature2consis:
+                re_cnnfeature_ = Variable(re_cnnfeature.detach().data, requires_grad=False)
+                r_consistency_loss = consistency_weight * consistency_criterion(r_cnnfeature, re_cnnfeature_) / minibatch_size
+            else:
+                r_consistency_loss = consistency_weight * consistency_criterion(r_cons_logit, re_class_logit) / minibatch_size
+            meters.update('r_cons_loss', r_consistency_loss.data[0])
+            r_loss += r_consistency_loss
+
+            c_consistency_loss = consistency_weight * consistency_criterion(c_cons_logit, re_class_logit) / minibatch_size
+            meters.update('c_cons_loss', c_consistency_loss.data[0])
+            c_loss += c_consistency_loss
+
+        if args.stabilization_loss_switch:
+            # stabilization loss
+            # value (cls_v) and index (cls_i) of the max probability in the prediction
+            l_cls_v, l_cls_i = torch.max(F.softmax(l_class_logit, dim=1), dim=1)
+            r_cls_v, r_cls_i = torch.max(F.softmax(r_class_logit, dim=1), dim=1)
+            le_cls_v, le_cls_i = torch.max(F.softmax(le_class_logit, dim=1), dim=1)
+            re_cls_v, re_cls_i = torch.max(F.softmax(re_class_logit, dim=1), dim=1)
+
+            l_cls_i = l_cls_i.data.cpu().numpy()
+            r_cls_i = r_cls_i.data.cpu().numpy()
+            le_cls_i = le_cls_i.data.cpu().numpy()
+            re_cls_i = re_cls_i.data.cpu().numpy()
+
+            # stable prediction mask
+            l_mask = (l_cls_v > args.stable_threshold).data.cpu().numpy()
+            r_mask = (r_cls_v > args.stable_threshold).data.cpu().numpy()
+            le_mask = (le_cls_v > args.stable_threshold).data.cpu().numpy()
+            re_mask = (re_cls_v > args.stable_threshold).data.cpu().numpy()
+
+            # detach logit -> for generating stablilization target
+            in_r_cons_logit = Variable(r_cons_logit.detach().data, requires_grad=False)
+            tar_l_class_logit = Variable(l_class_logit.clone().detach().data, requires_grad=False)
+
+            in_l_cons_logit = Variable(l_cons_logit.detach().data, requires_grad=False)
+            tar_r_class_logit = Variable(r_class_logit.clone().detach().data, requires_grad=False)
+
+            in_r_cnnfeature = Variable(r_cnnfeature.detach().data, requires_grad=False)
+            tar_l_cnnfeature = Variable(l_cnnfeature.clone().detach().data, requires_grad=False)
+
+            in_l_cnnfeature = Variable(l_cnnfeature.detach().data, requires_grad=False)
+            tar_r_cnnfeature = Variable(r_cnnfeature.clone().detach().data, requires_grad=False)
+
+            # generate target for each sample
+            for sdx in range(0, minibatch_size):
+                l_stable = False
+                if l_mask[sdx] == 0 and le_mask[sdx] == 0:
+                    # unstable: do not satisfy 2nd condition
+                    tar_l_class_logit[sdx, ...] = in_r_cons_logit[sdx, ...]
+                    # tar_l_cnnfeature[sdx, ...] = in_r_cnnfeature[sdx, ...]
+
+                elif l_cls_i[sdx] != le_cls_i[sdx]:
+                    # unstable: do not satisfy 1st condition
+                    tar_l_class_logit[sdx, ...] = in_r_cons_logit[sdx, ...]
+                    # tar_l_cnnfeature[sdx, ...] = in_r_cnnfeature[sdx, ...]
+                else:
+                    l_stable = True
+
+                r_stable = False
+                if r_mask[sdx] == 0 and re_mask[sdx] == 0:
+                    # unstable: do not satisfy 2nd condition
+                    tar_r_class_logit[sdx, ...] = in_l_cons_logit[sdx, ...]
+                    # tar_r_cnnfeature[sdx, ...] = in_l_cnnfeature[sdx, ...]
+                elif r_cls_i[sdx] != re_cls_i[sdx]:
+                    # unstable: do not satisfy 1st condition
+                    tar_r_class_logit[sdx, ...] = in_l_cons_logit[sdx, ...]
+                    # tar_r_cnnfeature[sdx, ...] = in_l_cnnfeature[sdx, ...]
+                else:
+                    r_stable = True
+
+                # calculate stanility if both models are stable for a sample
+                if l_stable and r_stable:
+                    # compare by consistency
+                    l_sample_cons = consistency_criterion(l_cons_logit[sdx:sdx+1, ...], le_class_logit[sdx:sdx+1, ...])
+                    r_sample_cons = consistency_criterion(r_cons_logit[sdx:sdx+1, ...], re_class_logit[sdx:sdx+1, ...])
+                    if l_sample_cons.data.cpu().numpy()[0] < r_sample_cons.data.cpu().numpy()[0]:
+                        # loss: l -> r
+                        tar_r_class_logit[sdx, ...] = in_l_cons_logit[sdx, ...]
+                        # tar_r_cnnfeature[sdx, ...] = in_l_cnnfeature[sdx, ...]
+                    elif l_sample_cons.data.cpu().numpy()[0] > r_sample_cons.data.cpu().numpy()[0]:
+                        # loss: r -> l
+                        tar_l_class_logit[sdx, ...] = in_r_cons_logit[sdx, ...]
+                        # tar_l_cnnfeature[sdx, ...] = in_r_cnnfeature[sdx, ...]
+
+            # calculate stablization weight
+            stabilization_weight = args.stabilization_scale * ramps.sigmoid_rampup(epoch, args.stabilization_rampup)
+            if not args.exclude_unlabeled:
+                stabilization_weight = (unlabeled_minibatch_size / minibatch_size) * stabilization_weight
+
+            # stabilization loss for r model
+            if args.exclude_unlabeled:
+                r_stabilization_loss = stabilization_weight * stabilization_criterion(r_cons_logit, tar_l_class_logit) / minibatch_size
+            else:
+                for idx in range(unlabeled_minibatch_size, minibatch_size):
+                    tar_l_class_logit[idx, ...] = in_r_cons_logit[idx, ...]
+                    # tar_l_cnnfeature[idx, ...] = in_r_cnnfeature[idx, ...]
+                r_stabilization_loss = stabilization_weight * stabilization_criterion(r_cons_logit, tar_l_class_logit) / unlabeled_minibatch_size
+            meters.update('r_stable_loss', r_stabilization_loss.data[0])
+            r_loss += r_stabilization_loss
+
+            # stabilization loss for l model
+            if args.exclude_unlabeled:
+                if args.cnnfeature2stable:
+                    l_stabilization_loss = stabilization_weight * stabilization_criterion(l_cnnfeature, tar_r_cnnfeature) / minibatch_size
+                else:
+                    l_stabilization_loss = stabilization_weight * stabilization_criterion(l_cons_logit, tar_r_class_logit) / minibatch_size
+            else:
+                for idx in range(unlabeled_minibatch_size, minibatch_size):
+                    tar_r_class_logit[idx, ...] = in_l_cons_logit[idx, ...]
+                    # tar_r_cnnfeature[idx, ...] = in_l_cnnfeature[idx, ...]
+                if args.cnnfeature2stable:
+                    l_stabilization_loss = stabilization_weight * stabilization_criterion(l_cnnfeature, tar_r_cnnfeature) / unlabeled_minibatch_size
+                else:
+                    l_stabilization_loss = stabilization_weight * stabilization_criterion(l_cons_logit, tar_r_class_logit) / unlabeled_minibatch_size
+
+            meters.update('l_stable_loss', l_stabilization_loss.data[0])
+            l_loss += l_stabilization_loss
+
+            c_stabilization_loss = stabilization_weight * stabilization_criterion(c_cons_logit,
+                                                                                  tar_l_class_logit) / unlabeled_minibatch_size
+            meters.update('c_stable_loss', c_stabilization_loss.data[0])
+            c_loss += c_stabilization_loss
+
+        if np.isnan(l_loss.data[0]) or np.isnan(r_loss.data[0]) or np.isnan(c_loss.data[0]):
+            LOG.info('Loss value equals to NAN!')
+            continue
+        assert not (l_loss.data[0] > 1e5), 'L-Loss explosion: {}'.format(l_loss.data[0])
+        assert not (r_loss.data[0] > 1e5), 'R-Loss explosion: {}'.format(r_loss.data[0])
+        assert not (c_loss.data[0] > 1e5), 'C-Loss explosion: {}'.format(c_loss.data[0])
+
+        meters.update('l_loss', l_loss.data[0])
+        meters.update('r_loss', r_loss.data[0])
+        meters.update('c_loss', c_loss.data[0])
+
+        # calculate prec and error
+        l_prec = mt_func.accuracy(l_class_logit.data, target_var.data, topk=(1, ))[0]
+        r_prec = mt_func.accuracy(r_class_logit.data, target_var.data, topk=(1, ))[0]
+        c_prec = mt_func.accuracy(c_class_logit.data, target_var.data, topk=(1, ))[0]
+
+        meters.update('l_top1', l_prec[0], labeled_minibatch_size)
+        meters.update('l_error1', 100. - l_prec[0], labeled_minibatch_size)
+
+        meters.update('r_top1', r_prec[0], labeled_minibatch_size)
+        meters.update('r_error1', 100. - r_prec[0], labeled_minibatch_size)
+
+        meters.update('c_top1', c_prec[0], labeled_minibatch_size)
+        meters.update('c_error1', 100. - c_prec[0], labeled_minibatch_size)
+
+        # update model
+        l_optimizer.zero_grad()
+        l_loss.backward()
+        l_optimizer.step()
+        if not args.resume_r:
+            r_optimizer.zero_grad()
+            r_loss.backward()
+            r_optimizer.step()
+
+        c_optimizer.zero_grad()
+        c_loss.backward()
+        c_optimizer.step()
+
+        # record
+        global_step += 1
+        meters.update('batch_time', time.time() - end)
+        end = time.time()
+
+        if i % args.print_freq == 0:
+            LOG.info('Epoch: [{0}][{1}/{2}]\t'
+                     'Batch-T {meters[batch_time]:.3f}\t'
+                     'L-Class {meters[l_class_loss]:.4f}\t'
+                     'R-Class {meters[r_class_loss]:.4f}\t'
+                     'C-Class {meters[c_class_loss]:.4f}\t'
+                     'L-Prec@1 {meters[l_top1]:.3f}\t'
+                     'R-Prec@1 {meters[r_top1]:.3f}\t'
+                     'C-Prec@1 {meters[c_top1]:.3f}\t'
+                     .format(epoch, i, len(train_loader), meters=meters))
+            if args.res_loss_switch:
+                LOG.info('L-Res {meters[l_res_loss]:.4f}\t'
+                         'R-Res {meters[r_res_loss]:.4f}\t'
+                         'C-Res {meters[c_res_loss]:.4f}\t'
+                         .format(epoch, i, len(train_loader), meters=meters))
+            if args.consistency_loss_switch:
+                LOG.info('L-Cons {meters[l_cons_loss]:.4f}\t'
+                         'R-Cons {meters[r_cons_loss]:.4f}\t'
+                         'C-Cons {meters[c_cons_loss]:.4f}\t'
+                         .format(epoch, i, len(train_loader), meters=meters))
+            if args.stabilization_loss_switch:
+                LOG.info('L-Stable {meters[l_stable_loss]:.4f}\t'
+                         'R-Stable {meters[r_stable_loss]:.4f}\t'
+                         'C-Stable {meters[c_stable_loss]:.4f}\t'
+                         .format(epoch, i, len(train_loader), meters=meters))
+
+            log.record(epoch + i / len(train_loader), {
+                'step': global_step,
+                **meters.values(),
+                **meters.averages(),
+                **meters.sums()})
+
 def main(context):
     global best_prec1_l
     global best_prec1_r
+    global best_prec1_c
     global best_prec1
     global global_step
 
@@ -520,6 +870,15 @@ def main(context):
                                   momentum=args.momentum,
                                   weight_decay=args.weight_decay,
                                   nesterov=args.nesterov)
+    if args.arch_c != 'None':
+        c_validation_log = context.create_train_log('c_validation')
+        c_model = create_model_c(name='c', num_classes=num_classes)
+        LOG.info(parameters_string(c_model))
+        c_optimizer = torch.optim.SGD(params=c_model.parameters(),
+                                      lr=args.lr,
+                                      momentum=args.momentum,
+                                      weight_decay=args.weight_decay,
+                                      nesterov=args.nesterov)
 
     # restore saved checkpoint
     if args.resume:
@@ -560,16 +919,23 @@ def main(context):
         validate(eval_loader, l_model, l_validation_log, global_step, args.start_epoch)
         LOG.info('Validating the right model: ')
         validate(eval_loader, r_model, r_validation_log, global_step, args.start_epoch)
+        if args.arch_c != 'None':
+            LOG.info('Validating the center model: ')
+            validate(eval_loader, c_model, c_validation_log, global_step, args.start_epoch)
         return
 
     # training
     is_best = False
     is_best_l = False
     is_best_r = False
+    is_best_c = False
+
     for epoch in range(args.start_epoch, args.epochs):
         start_time = time.time()
-
-        train_epoch(train_loader, l_model, r_model, l_optimizer, r_optimizer, epoch, training_log)
+        if args.arch_c != 'None':
+            train_epoch_three(train_loader, l_model, r_model, c_model, l_optimizer, r_optimizer, c_optimizer, epoch, training_log)
+        else:
+            train_epoch(train_loader, l_model, r_model, l_optimizer, r_optimizer, epoch, training_log)
         LOG.info('--- training epoch in {} seconds ---'.format(time.time() - start_time))
 
         if args.validation_epochs and (epoch + 1) % args.validation_epochs == 0:
@@ -588,6 +954,11 @@ def main(context):
             best_prec1 = max(better_prec1, best_prec1)
             best_prec1_l = max(l_prec1, best_prec1_l)
             best_prec1_r = max(r_prec1, best_prec1_r)
+            if args.arch_c != 'None':
+                LOG.info('Validating the center model: ')
+                c_prec1 = validate(eval_loader, c_model, c_validation_log, global_step, epoch + 1)
+                is_best_c = c_prec1 > best_prec1_c
+                best_prec1_c = max(c_prec1, best_prec1_c)
 
         # save checkpoint
         if is_best_l:
@@ -616,10 +987,26 @@ def main(context):
                 'r_optimizer':r_optimizer.state_dict(),
             }, False, checkpoint_path, '_best_r')
 
+        if is_best_c and args.arch_c != 'None':
+            best_epoch_c = epoch + 1
+            mt_func.save_checkpoint({
+                'epoch': epoch + 1,
+                'global_step': global_step,
+                'best_prec1': best_prec1_c,
+                'arch': args.arch,
+                'l_model': l_model.state_dict(),
+                'r_model': c_model.state_dict(),
+                'l_optimizer':l_optimizer.state_dict(),
+                'r_optimizer':c_optimizer.state_dict(),
+            }, False, checkpoint_path, '_best_c')
     LOG.info('Best top1 prediction l: {0}'.format(best_prec1_l))
     LOG.info('Best top1 prediction r: {0}'.format(best_prec1_r))
     LOG.info('Best top1 prediction l epoch: {0}'.format(best_epoch_l))
     LOG.info('Best top1 prediction r epoch: {0}'.format(best_epoch_r))
+    if args.arch_c != 'None':
+        LOG.info('Best top1 prediction c: {0}'.format(best_prec1_c))
+        LOG.info('Best top1 prediction c epoch: {0}'.format(best_epoch_c))
+
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
