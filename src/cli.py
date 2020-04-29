@@ -75,6 +75,8 @@ def create_parser():
                         help='model architecture: ' + ' | '.join(architectures.__all__))
     parser.add_argument('--arch-r', '-ar', metavar='ARCH', default='None', choices=architectures.__all__,
                         help='model architecture: ' + ' | '.join(architectures.__all__))
+    parser.add_argument('--arch-c', '-ac', metavar='ARCH', default='None', choices=architectures.__all__,
+                        help='model architecture: ' + ' | '.join(architectures.__all__))
     # constraint
     parser.add_argument('--consistency-type', default="mse", type=str, metavar='TYPE', choices=['mse', 'kl'],
                         help='consistency loss type to use')
